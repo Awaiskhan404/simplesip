@@ -4,10 +4,10 @@ Simple SIP Client Library (simplesip)
 A Python library for SIP (Session Initiation Protocol) communication with RTP audio streaming capabilities.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.4"
 __author__ = "Awais Khan"
 __email__ = "contact@awaiskhan.com.pk"
 
-from .client import SimpleSIPClient
+from .client import SimpleSIPClient, CallState
 
-__all__ = ["SimpleSIPClient"]
+__all__ = ["SimpleSIPClient", "CallState"]

@@ -63,6 +63,10 @@ class SimpleSIPClient:
         self.rtp_timestamp = random.randint(0, 4294967295)
         self.rtp_ssrc = random.randint(0, 4294967295)
         
+        self._last_bye_call_id = None
+        self.incoming_invite_headers = None
+        self.detected_rtp_profile = 'RTP/AVP'
+        
         # Configure logging for errors and minimal info
         logging.basicConfig(
             level=logging.INFO,
@@ -74,22 +78,30 @@ class SimpleSIPClient:
         self.logger = logging.getLogger(__name__)
 
     def connect(self):
-        """Connect to the SIP server and initialize RTP socket"""
+        """Connect to the SIP server with enhanced RTP socket setup"""
         try:
             self.local_ip = self.get_local_ip()
             
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.bind((self.local_ip, 5060))
-            self.sock.settimeout(0.5)  # Reduced timeout for faster 491 response
+            self.sock.settimeout(0.5)
             
             # Enable socket reuse
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
+            # Enhanced RTP socket setup for better audio flow
             self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.rtp_sock.bind((self.local_ip, self.local_rtp_port))
-            self.rtp_sock.settimeout(0.1)
+            self.rtp_sock.settimeout(0.01)  # Very short timeout for responsive audio
             self.rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            
+            # Increase socket buffer sizes for audio
+            try:
+                self.rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                self.rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            except:
+                pass  # Ignore if not supported
+            
             self.logger.info(f"RTP socket bound to {self.local_ip}:{self.local_rtp_port}")
             
             self.running = True
@@ -215,7 +227,7 @@ class SimpleSIPClient:
         return sdp
             
     def _parse_sdp_answer(self, sdp):
-        """Parse SDP answer to get remote RTP info and negotiated codec"""
+        """Parse SDP answer to get remote RTP info and negotiated codec with profile detection"""
         lines = sdp.split('\r\n')
         ip = None
         port = None
@@ -234,7 +246,7 @@ class SimpleSIPClient:
                 if len(parts) >= 3:
                     try:
                         port = int(parts[1])
-                        rtp_profile = parts[2]  # RTP/AVP, RTP/SAVPF, etc.
+                        rtp_profile = parts[2]  # RTP/AVP, RTP/AVPF, RTP/SAVPF, etc.
                         payload_types = [int(pt) for pt in parts[3:] if pt.isdigit()]
                     except ValueError:
                         continue
@@ -247,6 +259,9 @@ class SimpleSIPClient:
                     codec_map[pt] = codec_name
             elif line.startswith('a=candidate:'):
                 ice_candidates.append(line)
+        
+        # Store the detected RTP profile for use in SDP answers
+        self.detected_rtp_profile = rtp_profile or 'RTP/AVP'
         
         if payload_types and codec_map:
             self.negotiated_payload_type = payload_types[0]
@@ -336,33 +351,19 @@ class SimpleSIPClient:
                 self.logger.error(f"Error in RTP test to {test_endpoint}: {str(e)}")
     
     def send_audio(self, audio_data):
-        """Improved audio transmission with codec-aware encoding"""
+        """Send audio data as-is (assumes pre-encoded mulaw 8kHz)"""
         if not self.remote_rtp_info or not audio_data or not self.running:
             return
             
         try:
             payload_type = self.negotiated_payload_type or 0
-            codec = self.negotiated_codec or 'PCMU'
+            samples_per_packet = 160  # 20ms at 8kHz
+            chunk_size = 160  # mulaw: 1 byte per sample
             
-            if codec == 'G722':
-                encoded_data = self._g722_encode(audio_data)
-                samples_per_packet = 160  # G.722 RTP clock is still 8kHz
-            elif codec == 'PCMA':
-                encoded_data = self._pcm_to_alaw(audio_data)
-                samples_per_packet = 160
-            else:  # PCMU or fallback
-                encoded_data = self._pcm_to_ulaw(audio_data)
-                samples_per_packet = 160
+            self.logger.debug(f"Audio: {len(audio_data)} bytes, {chunk_size} bytes per packet")
             
-            if codec == 'G722':
-                chunk_size = 80
-            else:
-                chunk_size = samples_per_packet  # PCMU/PCMA: 160 bytes for 20ms
-            
-            self.logger.debug(f"Audio: {len(encoded_data)} bytes encoded, {chunk_size} bytes per packet")
-            
-            for i in range(0, len(encoded_data), chunk_size):
-                chunk = encoded_data[i:i+chunk_size]
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i+chunk_size]
                 if not chunk:
                     continue
                     
@@ -378,7 +379,7 @@ class SimpleSIPClient:
                 self.rtp_seq = (self.rtp_seq + 1) % 65536
                 self.rtp_timestamp += samples_per_packet
                 
-                time.sleep(0.02)
+                time.sleep(0.02)  # 20ms timing
                 
         except Exception as e:
             self.logger.error(f"Error sending RTP: {str(e)}")
@@ -388,9 +389,10 @@ class SimpleSIPClient:
         if not payload:
             return
             
-        pcm_data = self._ulaw_to_pcm(payload)
+        # pcm_data = self._ulaw_to_pcm(payload)
         
-        self._add_to_jitter_buffer(pcm_data, timestamp)
+        # self._add_to_jitter_buffer(pcm_data, timestamp)
+        self.audio_received_callback(payload, 'mulaw', timestamp)
     
     def _handle_pcma_payload(self, payload, timestamp):
         """Process PCMA (G.711 A-law) audio with jitter buffer"""
@@ -451,60 +453,138 @@ class SimpleSIPClient:
                 self.audio_received_callback(pcm_data, 'pcm', play_time)
             except Exception as e:
                 self.logger.error(f"Audio callback error: {str(e)}")
+                
+    def _send_test_rtp_packet(self):
+        """Send enhanced test RTP packets to establish audio flow"""
+        if not self.remote_rtp_info:
+            return
+            
+        try:
+            # Send multiple test packets with different payload types
+            for pt in [0, 8]:  # PCMU and PCMA
+                header = struct.pack('!BBHII', 
+                                    0x80,  # Version=2, Padding=0, Extension=0, CC=0
+                                    pt,    # Payload type
+                                    self.rtp_seq,
+                                    self.rtp_timestamp,
+                                    self.rtp_ssrc)
+                
+                # Add some silence payload (20ms worth)
+                if pt == 0:  # PCMU
+                    payload = bytes([0xFF] * 160)  # μ-law silence
+                else:  # PCMA
+                    payload = bytes([0xD5] * 160)  # A-law silence
+                
+                self.rtp_sock.sendto(header + payload, self.remote_rtp_info)
+                self.logger.info(f"📤 Enhanced test RTP PT{pt} sent to {self.remote_rtp_info}")
+                
+                self.rtp_seq = (self.rtp_seq + 1) % 65536
+                self.rtp_timestamp = (self.rtp_timestamp + 160) % 4294967296
+                
+                time.sleep(0.02)  # 20ms between packets
+            
+            # Send periodic test packets
+            threading.Timer(2.0, self._send_periodic_audio).start()
+            
+        except Exception as e:
+            self.logger.error(f"Error sending test RTP packet: {str(e)}")
+    
+    def _send_periodic_audio(self):
+        """Send periodic audio to keep RTP flow alive"""
+        if not self.remote_rtp_info or not self.running or self.call_state != CallState.CONNECTED:
+            return
+            
+        try:
+            # Send comfort noise/silence every 2 seconds
+            pt = self.negotiated_payload_type or 0
+            
+            header = struct.pack('!BBHII', 
+                                0x80,  # Version=2
+                                pt,    # Use negotiated payload type
+                                self.rtp_seq,
+                                self.rtp_timestamp,
+                                self.rtp_ssrc)
+            
+            # Generate silence based on codec
+            if pt == 0:  # PCMU
+                payload = bytes([0xFF] * 160)  # μ-law silence
+            elif pt == 8:  # PCMA
+                payload = bytes([0xD5] * 160)  # A-law silence
+            else:
+                payload = bytes([0x00] * 160)  # Generic silence
+            
+            self.rtp_sock.sendto(header + payload, self.remote_rtp_info)
+            self.logger.debug(f"🔊 Periodic audio sent (PT {pt})")
+            
+            self.rtp_seq = (self.rtp_seq + 1) % 65536
+            self.rtp_timestamp = (self.rtp_timestamp + 160) % 4294967296
+            
+            # Schedule next periodic audio
+            threading.Timer(2.0, self._send_periodic_audio).start()
+            
+        except Exception as e:
+            self.logger.error(f"Error sending periodic audio: {str(e)}")
     
     def _rtp_receive_thread(self):
-            """Improved RTP receive thread with jitter buffer"""
-            self.logger.info("🎙️ Enhanced RTP receive thread started")
-            
-            jitter_buffer_size = 50  # ms
-            last_seq = None
-            last_timestamp = None
-            
-            while self.running:
-                try:
-                    data, addr = self.rtp_sock.recvfrom(2048)
-                    if len(data) < 12:  # Minimum RTP header size
-                        continue
-                        
-                    header = struct.unpack('!BBHII', data[:12])
-                    version = (header[0] >> 6) & 0x03
-                    padding = (header[0] >> 5) & 0x01
-                    extension = (header[0] >> 4) & 0x01
-                    csrc_count = header[0] & 0x0F
-                    marker = (header[1] >> 7) & 0x01
-                    payload_type = header[1] & 0x7F
-                    sequence = header[2]
-                    timestamp = header[3]
-                    ssrc = header[4]
-                    
-                    if last_seq is not None:
-                        diff = (sequence - last_seq) % 65536
-                        if diff > 1:
-                            self.logger.debug(f"Packet loss detected: {diff-1} packets")
-                            
-                    last_seq = sequence
-                    last_timestamp = timestamp
-                    
-                    payload = data[12+csrc_count*4:]  # Skip CSRC if present
-                    
-                    if payload_type == 0:  # PCMU
-                        self._handle_pcmu_payload(payload, timestamp)
-                    elif payload_type == 8:  # PCMA
-                        self._handle_pcma_payload(payload, timestamp)
-                    elif payload_type == 9:  # G.722
-                        self._handle_g722_payload(payload, timestamp)
-                    elif payload_type == 101:  # DTMF
-                        self._handle_dtmf_payload(payload)
-                        
-                    # Update call state
-                    if self.call_state == CallState.CONNECTED:
-                        self.call_state = CallState.STREAMING
-                        
-                except socket.timeout:
+        """Enhanced RTP receive thread with better packet handling"""
+        self.logger.info("🎙️ Enhanced RTP receive thread started")
+        
+        last_seq = None
+        packets_received = 0
+        
+        while self.running:
+            try:
+                data, addr = self.rtp_sock.recvfrom(2048)
+                packets_received += 1
+                
+                if len(data) < 12:  # Minimum RTP header size
                     continue
-                except Exception as e:
+                    
+                header = struct.unpack('!BBHII', data[:12])
+                version = (header[0] >> 6) & 0x03
+                padding = (header[0] >> 5) & 0x01
+                extension = (header[0] >> 4) & 0x01
+                csrc_count = header[0] & 0x0F
+                marker = (header[1] >> 7) & 0x01
+                payload_type = header[1] & 0x7F
+                sequence = header[2]
+                timestamp = header[3]
+                ssrc = header[4]
+                
+                # Log first few packets and then periodically
+                if packets_received <= 5 or packets_received % 100 == 0:
+                    self.logger.info(f"🎙️ RTP received: PT={payload_type}, seq={sequence}, from {addr}")
+                
+                if last_seq is not None:
+                    diff = (sequence - last_seq) % 65536
+                    if diff > 1 and diff < 1000:  # Reasonable packet loss detection
+                        self.logger.debug(f"Packet loss detected: {diff-1} packets")
+                        
+                last_seq = sequence
+                
+                payload = data[12+csrc_count*4:]  # Skip CSRC if present
+                
+                if payload_type == 0:  # PCMU
+                    self._handle_pcmu_payload(payload, timestamp)
+                elif payload_type == 8:  # PCMA
+                    self._handle_pcma_payload(payload, timestamp)
+                elif payload_type == 9:  # G.722
+                    self._handle_g722_payload(payload, timestamp)
+                elif payload_type == 101:  # DTMF
+                    self._handle_dtmf_payload(payload)
+                else:
+                    self.logger.debug(f"Unknown payload type: {payload_type}")
+                    
+                # Update call state
+                if self.call_state == CallState.CONNECTED:
+                    self.call_state = CallState.STREAMING
+                    
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
                     self.logger.error(f"RTP receive error: {str(e)}")
-                    time.sleep(0.01)
+                time.sleep(0.01)
                 
     def _audio_processing_thread(self):
         """Thread to process incoming audio data and trigger callbacks"""
@@ -517,6 +597,9 @@ class SimpleSIPClient:
                         if self.audio_callback_format == 'pcm':
                             pcm_data = self._ulaw_to_pcm(pcmu_data)
                             self.audio_received_callback(pcm_data, 'pcm')
+                        elif self.audio_callback_format == 'mulaw':
+                            pcm_data = self._pcm_to_ulaw(pcmu_data)
+                            self.audio_received_callback(pcm_data, 'mulaw')
                         elif self.get_audio_config()['codec'] == 'g722':
                             g722_data = self._g722_decode(pcmu_data)
                             self.audio_received_callback(g722_data, 'g722')
@@ -538,6 +621,11 @@ class SimpleSIPClient:
         self.audio_received_callback = callback_func
         self.audio_callback_format = format
         self.logger.info(f"📻 Audio callback registered (format: {format})")
+        
+        
+        if self.remote_rtp_info and self.call_state in [CallState.CONNECTED, CallState.STREAMING]:
+            self.logger.info("🔊 Sending test audio after callback registration...")
+            self._send_test_rtp_packet()
     
     def remove_audio_callback(self):
         """Remove audio callback"""
@@ -830,15 +918,163 @@ class SimpleSIPClient:
         }
     
     def answer_call(self, request_headers):
-        """Answer an incoming call with proper SDP"""
-        sdp_body = self._generate_sdp_offer()
+        """Answer an incoming call with proper SDP negotiation"""
+        
+        # Generate SDP answer based on the offer received
+        sdp_body = self._generate_sdp_answer(request_headers.get('body', ''))
         
         additional_headers = {
             'Contact': f'<sip:{self.username}@{self.local_ip}:5060>',
             'User-Agent': 'BetterSIPClient/1.0'
         }
         
+        # Send 200 OK with SDP
         self._send_response(request_headers, 200, 'OK', additional_headers, sdp_body)
+        self.logger.info(f"📤 Sent 200 OK with SDP answer")
+        
+    
+    def _generate_sdp_answer(self, sdp_offer=None):
+        """Generate SDP answer that properly handles AVPF requirements"""
+        
+        # Parse the offer to determine RTP profile and supported codecs
+        offered_codecs = []
+        offered_profile = 'RTP/AVP'  # Default fallback
+        
+        if sdp_offer:
+            offered_codecs = self._parse_offered_codecs(sdp_offer)
+            offered_profile = self._extract_rtp_profile(sdp_offer)
+            self.logger.info(f"🎵 Offered codecs: {offered_codecs}")
+            self.logger.info(f"🔒 Offered RTP profile: {offered_profile}")
+        
+        session_id = int(time.time())
+        
+        # CRITICAL FIX: Match the offered profile exactly
+        # Asterisk with AVPF enabled REQUIRES AVPF response
+        rtp_profile = offered_profile
+        
+        self.logger.info(f"🔧 Responding with matching profile: {rtp_profile}")
+        
+        # Select codecs that are common between offer and our capabilities
+        # Prioritize in order: PCMU, PCMA, G722, then DTMF
+        supported_codecs = []
+        
+        if any('PCMU' in codec for codec in offered_codecs):
+            supported_codecs.append("0")
+        if any('PCMA' in codec for codec in offered_codecs):
+            supported_codecs.append("8")
+        if any('G722' in codec for codec in offered_codecs):
+            supported_codecs.append("9")
+        
+        # Always add DTMF if offered
+        if any('TELEPHONE-EVENT' in codec for codec in offered_codecs):
+            supported_codecs.append("101")
+        
+        # Fallback to basic codecs if nothing matched
+        if not supported_codecs:
+            supported_codecs = ["0", "8", "101"]
+        
+        codec_list = " ".join(supported_codecs)
+        
+        # Generate SDP answer with matching profile
+        sdp = (f"v=0\r\n"
+            f"o={self.username} {session_id} 1 IN IP4 {self.local_ip}\r\n"
+            f"s=SIP Call\r\n"
+            f"c=IN IP4 {self.local_ip}\r\n"
+            f"t=0 0\r\n"
+            f"m=audio {self.local_rtp_port} {rtp_profile} {codec_list}\r\n")
+        
+        # Add codec mappings for supported codecs
+        if "0" in supported_codecs:
+            sdp += f"a=rtpmap:0 PCMU/8000\r\n"
+        if "8" in supported_codecs:
+            sdp += f"a=rtpmap:8 PCMA/8000\r\n"
+        if "9" in supported_codecs:
+            sdp += f"a=rtpmap:9 G722/8000\r\n"
+        if "101" in supported_codecs:
+            sdp += f"a=rtpmap:101 telephone-event/8000\r\n"
+            sdp += f"a=fmtp:101 0-16\r\n"
+        
+        # Add required attributes based on profile
+        if 'AVPF' in rtp_profile:
+            # AVPF requires rtcp-mux
+            sdp += f"a=rtcp-mux\r\n"
+            
+            # Add minimal AVPF feedback attributes
+            if "0" in supported_codecs:
+                sdp += f"a=rtcp-fb:0 ccm fir\r\n"
+            if "8" in supported_codecs:
+                sdp += f"a=rtcp-fb:8 ccm fir\r\n"
+            if "9" in supported_codecs:
+                sdp += f"a=rtcp-fb:9 ccm fir\r\n"
+        
+        sdp += f"a=sendrecv\r\n"
+        
+        self.logger.info(f"🎵 Generated SDP answer with profile: {rtp_profile}")
+        return sdp
+    
+    def _extract_rtp_profile(self, sdp_offer):
+        """Extract RTP profile from SDP offer"""
+        lines = sdp_offer.split('\r\n')
+        
+        for line in lines:
+            if line.startswith('m=audio'):
+                parts = line.split()
+                if len(parts) >= 3:
+                    return parts[2]  # Return the RTP profile
+        
+        return 'RTP/AVP'
+    
+    def _parse_offered_codecs(self, sdp_offer):
+        """Parse codecs offered in incoming SDP"""
+        offered_codecs = []
+        lines = sdp_offer.split('\r\n')
+        
+        for line in lines:
+            if line.startswith('a=rtpmap:'):
+                parts = line[9:].split(' ', 1)
+                if len(parts) == 2:
+                    pt = parts[0]
+                    codec_info = parts[1]
+                    codec_name = codec_info.split('/')[0].upper()
+                    offered_codecs.append(f"{codec_name}({pt})")
+        
+        return offered_codecs
+    
+    
+    def _handle_notify(self, message, headers):
+        """Handle NOTIFY messages (typically for call status updates)"""
+        
+        # Send 200 OK response for NOTIFY
+        additional_headers = {
+            'User-Agent': 'BetterSIPClient/1.0'
+        }
+        self._send_response(headers, 200, 'OK', additional_headers)
+        
+        # Log the NOTIFY content for debugging
+        event_header = headers.get('event', 'unknown')
+        self.logger.info(f"📢 NOTIFY received - Event: {event_header}")
+        
+    def _cleanup_call_state(self):
+        """Enhanced call state cleanup"""
+        if self.call_id:
+            invite_keys_to_remove = [k for k in self.sent_invites if self.call_id in k]
+            for k in invite_keys_to_remove:
+                self.sent_invites.discard(k)
+        
+        # Clear state variables
+        self.call_id = None
+        self.remote_rtp_info = None
+        self.remote_tag = None
+        self.invite_in_progress = False
+        self.call_state = CallState.IDLE
+        
+        # Clear any stored invite headers
+        if hasattr(self, 'incoming_invite_headers'):
+            delattr(self, 'incoming_invite_headers')
+        
+        # Clear last BYE tracking
+        if hasattr(self, '_last_bye_call_id'):
+            delattr(self, '_last_bye_call_id')
     
     def make_call(self, dest_number):
         """*** FIXED: Initiate a call with duplicate prevention ***"""
@@ -1210,37 +1446,97 @@ class SimpleSIPClient:
                 self._send_test_rtp_packet()
 
     def _handle_incoming_invite(self, message, headers):
-        """Enhanced incoming INVITE handling"""
+        """Enhanced incoming INVITE handling with proper state management"""
         
         call_id = headers.get('call-id', '')
+        from_header = headers.get('from', '')
+        
+        # Extract calling number for logging
+        calling_number = "Unknown"
+        if from_header and '<sip:' in from_header:
+            try:
+                calling_number = from_header.split('<sip:')[1].split('@')[0]
+            except:
+                pass
+        
+        self.logger.info(f"📞 INCOMING CALL from {calling_number}")
+        
+        # Set call ID and state
         if call_id:
             self.call_id = call_id
-        
+            
+        # Parse SDP if present
         if 'body' in headers:
-            self._parse_sdp_answer(headers['body'])
+            self.logger.info("🔍 Processing incoming SDP...")
+            sdp_parsed = self._parse_sdp_answer(headers['body'])
+            if not sdp_parsed:
+                self.logger.error("❌ Failed to parse incoming SDP")
+                self._send_response(headers, 488, 'Not Acceptable Here')
+                return
         
+        # Send 180 Ringing
         additional_headers = {
             'User-Agent': 'BetterSIPClient/1.0',
             'Contact': f'<sip:{self.username}@{self.local_ip}:5060>'
         }
         self._send_response(headers, 180, 'Ringing', additional_headers)
+        self.logger.info("🔔 Sent 180 Ringing")
         
-        threading.Timer(2.0, lambda: self.answer_call(headers)).start()
+        # Update call state properly
+        self.call_state = CallState.RINGING
+        
+        # Store the invite headers for later use
+        self.incoming_invite_headers = headers
+        
+        # Auto-answer after a short delay
+        def auto_answer():
+            time.sleep(1)  # Reduced delay
+            if self.call_id == call_id and self.running and self.call_state == CallState.RINGING:
+                self.logger.info("📞 Auto-answering call...")
+                try:
+                    self.answer_call(headers)
+                    self.call_state = CallState.CONNECTED
+                    self.logger.info("✅ CALL STATUS: CONNECTED - Inbound call answered successfully")
+                    
+                    # Send test RTP packet to establish media
+                    self._send_test_rtp_packet()
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Error answering call: {str(e)}")
+                    self.call_state = CallState.IDLE
+        
+        # Start auto-answer thread
+        threading.Thread(target=auto_answer, daemon=True).start()
         
     def _handle_bye(self, message, headers):
-        """Enhanced BYE handling"""
+        """Enhanced BYE handling with duplicate prevention"""
         
+        call_id = headers.get('call-id', '')
+        
+        # Check if this is a duplicate BYE for the same call
+        if hasattr(self, '_last_bye_call_id') and self._last_bye_call_id == call_id:
+            self.logger.info(f"🔄 Duplicate BYE ignored for call {call_id}")
+            return
+        
+        self._last_bye_call_id = call_id
+        
+        # Send 200 OK response
         additional_headers = {
             'User-Agent': 'BetterSIPClient/1.0'
         }
         self._send_response(headers, 200, 'OK', additional_headers)
+        self.logger.info(f"📤 Sent 200 OK for BYE")
         
-        call_id = headers.get('call-id', '')
+        # Clean up dialog
         if call_id in self.dialogs:
             del self.dialogs[call_id]
         
-        self._cleanup_call_state()
-        self.logger.info(f"📴 CALL STATUS: IDLE - Call terminated")
+        # Clean up call state only if this BYE is for the current call
+        if call_id == self.call_id:
+            self._cleanup_call_state()
+            self.logger.info(f"📴 CALL STATUS: IDLE - Call terminated by remote party")
+        else:
+            self.logger.info(f"📴 BYE processed for different call ID: {call_id}")
 
     def _cleanup_call_state(self):
         """*** NEW: Clean up call state and invite tracking ***"""
