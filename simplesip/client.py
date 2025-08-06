@@ -20,11 +20,13 @@ class CallState(Enum):
 
 
 class SimpleSIPClient:
-    def __init__(self, username, password, server, port=5060):
+    def __init__(self, username, password, server, port=5060, local_port=5060, local_ip="0.0.0.0"):
         self.username = username
         self.password = password
         self.server = server
         self.port = port
+        self.local_port = local_port
+        self.local_ip = local_ip
         self.call_id = None
         self.cseq = 1
         self.tag = str(random.randint(100000, 999999))
@@ -83,7 +85,7 @@ class SimpleSIPClient:
             self.local_ip = self.get_local_ip()
             
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.bind((self.local_ip, 5060))
+            self.sock.bind((self.local_ip, self.local_port))
             self.sock.settimeout(0.5)
             
             # Enable socket reuse
@@ -138,13 +140,13 @@ class SimpleSIPClient:
         call_id = f"{random.randint(100000, 999999)}@{self.local_ip}"
         
         msg = f"REGISTER sip:{self.server} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch};rport\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: <sip:{self.username}@{self.server}>\r\n" \
               f"Call-ID: {call_id}\r\n" \
               f"CSeq: {self.cseq} REGISTER\r\n" \
-              f"Contact: <sip:{self.username}@{self.local_ip}:5060>;expires=3600\r\n" \
+              f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>;expires=3600\r\n" \
               f"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO\r\n" \
               f"User-Agent: BetterSIPClient/1.0\r\n" \
               f"Expires: 3600\r\n" \
@@ -167,7 +169,7 @@ class SimpleSIPClient:
         call_id = f"{random.randint(100000, 999999)}@{self.local_ip}"
         
         msg = f"OPTIONS sip:{self.server} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch};rport\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: <sip:{self.server}>\r\n" \
@@ -900,7 +902,7 @@ class SimpleSIPClient:
         branch = self._generate_branch()
         
         msg = f"ACK {request_uri} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch}\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: {from_header}\r\n" \
               f"To: {to_header}\r\n" \
@@ -924,7 +926,7 @@ class SimpleSIPClient:
         sdp_body = self._generate_sdp_answer(request_headers.get('body', ''))
         
         additional_headers = {
-            'Contact': f'<sip:{self.username}@{self.local_ip}:5060>',
+            'Contact': f'<sip:{self.username}@{self.local_ip}:{self.local_port}>',
             'User-Agent': 'BetterSIPClient/1.0'
         }
         
@@ -947,6 +949,13 @@ class SimpleSIPClient:
             self.logger.info(f"🔒 Offered RTP profile: {offered_profile}")
         
         session_id = int(time.time())
+        
+        if 'SAVP' in offered_profile or 'SAVPF' in offered_profile:
+            rtp_profile = 'RTP/AVP'  # Force plain RTP for compatibility
+            self.logger.info(f"🔧 Server requested {offered_profile}, responding with plain RTP/AVP for compatibility")
+        else:
+            rtp_profile = offered_profile
+            self.logger.info(f"🔧 Responding with matching profile: {rtp_profile}")
         
         # CRITICAL FIX: Match the offered profile exactly
         # Asterisk with AVPF enabled REQUIRES AVPF response
@@ -1099,13 +1108,13 @@ class SimpleSIPClient:
         sdp_body = self._generate_sdp_offer()
         
         msg = f"INVITE sip:{dest_number}@{self.server} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch};rport\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: <sip:{dest_number}@{self.server}>\r\n" \
               f"Call-ID: {self.call_id}\r\n" \
               f"CSeq: {self.cseq} INVITE\r\n" \
-              f"Contact: <sip:{self.username}@{self.local_ip}:5060>\r\n" \
+              f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n" \
               f"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO\r\n" \
               f"User-Agent: BetterSIPClient/1.0\r\n" \
               f"Supported: replaces, timer\r\n" \
@@ -1218,13 +1227,13 @@ class SimpleSIPClient:
             auth_header += f', qop={self.auth_info["qop"]}, nc={nc}, cnonce="{cnonce}"'
         
         msg = f"INVITE {uri} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch};rport\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: <sip:{dest_number}@{self.server}>\r\n" \
               f"Call-ID: {call_id}\r\n" \
               f"CSeq: {self.cseq} INVITE\r\n" \
-              f"Contact: <sip:{self.username}@{self.local_ip}:5060>\r\n" \
+              f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n" \
               f"Authorization: {auth_header}\r\n" \
               f"User-Agent: BetterSIPClient/1.0\r\n" \
               f"Content-Type: application/sdp\r\n" \
@@ -1263,13 +1272,13 @@ class SimpleSIPClient:
             auth_header += f', opaque="{self.auth_info["opaque"]}"'
         
         msg = f"REGISTER {uri} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch};rport\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch};rport\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: <sip:{self.username}@{self.server}>\r\n" \
               f"Call-ID: {call_id}\r\n" \
               f"CSeq: {self.cseq} REGISTER\r\n" \
-              f"Contact: <sip:{self.username}@{self.local_ip}:5060>;expires=3600\r\n" \
+              f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>;expires=3600\r\n" \
               f"Authorization: {auth_header}\r\n" \
               f"User-Agent: BetterSIPClient/1.0\r\n" \
               f"Expires: 3600\r\n" \
@@ -1368,7 +1377,7 @@ class SimpleSIPClient:
         branch = self._generate_branch()
         
         msg = f"ACK {request_uri} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch}\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: {from_header}\r\n" \
               f"To: {to_header}\r\n" \
@@ -1477,7 +1486,7 @@ class SimpleSIPClient:
         # Send 180 Ringing
         additional_headers = {
             'User-Agent': 'BetterSIPClient/1.0',
-            'Contact': f'<sip:{self.username}@{self.local_ip}:5060>'
+            'Contact': f'<sip:{self.username}@{self.local_ip}:{self.local_port}>'
         }
         self._send_response(headers, 180, 'Ringing', additional_headers)
         self.logger.info("🔔 Sent 180 Ringing")
@@ -1644,7 +1653,7 @@ class SimpleSIPClient:
             to_header += f";tag={remote_tag}"
         
         msg = f"BYE {remote_uri} SIP/2.0\r\n" \
-              f"Via: SIP/2.0/UDP {self.local_ip}:5060;branch={branch}\r\n" \
+              f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n" \
               f"Max-Forwards: 70\r\n" \
               f"From: <sip:{self.username}@{self.server}>;tag={self.tag}\r\n" \
               f"To: {to_header}\r\n" \
